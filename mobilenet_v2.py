@@ -1,3 +1,4 @@
+from re import X
 from torch import nn
 import torch
 from torch.autograd.grad_mode import F
@@ -5,8 +6,11 @@ try:
     from torch.hub import load_state_dict_from_url
 except ImportError:
     from torch.utils.model_zoo import load_url as load_state_dict_from_url
+from torch.nn import init
 
 
+from torch import autograd
+import math
 
 __all__ = ['MobileNetV2', 'mobilenet_v2']
 
@@ -34,6 +38,37 @@ def _make_divisible(v, divisor, min_value=None):
     if new_v < 0.9 * v:
         new_v += divisor
     return new_v
+
+
+class TopKBinarizer(autograd.Function):
+    """
+    Top-k Binarizer.
+    Computes a binary mask M from a real value matrix S such that `M_{i,j} = 1` if and only if `S_{i,j}`
+    is among the k% highest values of S.
+
+    Implementation is inspired from:
+        https://github.com/allenai/hidden-networks
+        What's hidden in a randomly weighted neural network?
+        Vivek Ramanujan*, Mitchell Wortsman*, Aniruddha Kembhavi, Ali Farhadi, Mohammad Rastegari
+    """
+
+    @staticmethod
+    def forward(ctx, inputs: torch.tensor, sparsity: float, block_size : int):
+        mask = inputs.clone()
+        block_mask =  mask.reshape(block_size, -1)
+        block_shape = block_mask.shape
+        block_mask = torch.sum(block_mask, dim=0)
+        _, idx = block_mask.sort(descending=True)
+        j = int(sparsity * block_mask.numel())
+        block_mask[idx[j:]] = 0
+        block_mask[idx[:j]] = 1
+        block_mask = block_mask.unsqueeze(0).expand(block_shape)
+        block_mask = block_mask.reshape(inputs.shape)
+        return block_mask
+
+    @staticmethod
+    def backward(ctx, gradOutput):
+        return gradOutput, None, None
 
 
 class SparseDepthwiseConv(nn.Module):
@@ -65,11 +100,18 @@ class SparseDepthwiseConv(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.weight = nn.Parameter(torch.zeros(self.out_channels, self.in_channels))
+
+        self.mask_scores = nn.Parameter(torch.empty(self.weight.size()))
+        self.init_mask()
+
         if self.add_bias:
             self.bias = nn.Parameter(torch.zeros(self.out_channels))
         
         assert(self.out_channels % block_size == 0)
         self.first_run = True
+    
+    def init_mask(self):
+        init.kaiming_uniform_(self.mask_scores, a=math.sqrt(5))
 
     def block_topK_binarizer(self, inputs):
         # inputs: out_channel * in_channel
@@ -86,16 +128,21 @@ class SparseDepthwiseConv(nn.Module):
         return block_mask
 
     def forward(self, x):
-        if self.first_run:
-            mask = self.block_topK_binarizer(torch.abs(self.weight))
-            self.weight.data = self.weight.data * mask
-            self.first_run = False
+        # if self.first_run:
+        #     mask = self.block_topK_binarizer(torch.abs(self.weight))
+        #     self.weight.data = self.weight.data * mask
+        #     self.first_run = False
+
+        mask = TopKBinarizer.apply(self.mask_scores, self.sparsity, self.block_size)
+        weight_thresholded = mask * self.weight
 
         x = x.permute(0,2,3,1)
-        x = torch.matmul(x, self.weight.T)
+        x = torch.matmul(x, weight_thresholded.T)
         x = x.permute(0,3,1,2)
+
         if self.add_bias: 
             x = x + self.bias
+
         return x
 
 
@@ -283,4 +330,4 @@ if __name__ == "__main__":
     x = torch.zeros((16, 3, 224,224))
     y = model(x)
     # save model 
-    torch.save(model.state_dict(),"sparse_mobilenet_v2_s{}_b{}".format(sparsity, block_size))
+    # torch.save(model.state_dict(),"sparse_mobilenet_v2_s{}_b{}".format(sparsity, block_size))
