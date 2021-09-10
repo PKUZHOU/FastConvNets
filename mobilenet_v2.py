@@ -101,14 +101,11 @@ class SparseDepthwiseConv(nn.Module):
         self.out_channels = out_channels
         self.weight = nn.Parameter(torch.zeros(self.out_channels, self.in_channels))
 
-        self.mask_scores = nn.Parameter(torch.empty(self.weight.size()))
-        self.init_mask()
-
         if self.add_bias:
             self.bias = nn.Parameter(torch.zeros(self.out_channels))
         
         assert(self.out_channels % block_size == 0)
-        self.first_run = True
+        self.should_prune = False
     
     def init_mask(self):
         init.kaiming_uniform_(self.mask_scores, a=math.sqrt(5))
@@ -128,16 +125,13 @@ class SparseDepthwiseConv(nn.Module):
         return block_mask
 
     def forward(self, x):
-        # if self.first_run:
-        #     mask = self.block_topK_binarizer(torch.abs(self.weight))
-        #     self.weight.data = self.weight.data * mask
-        #     self.first_run = False
-
-        mask = TopKBinarizer.apply(self.mask_scores, self.sparsity, self.block_size)
-        weight_thresholded = mask * self.weight
+        if self.should_prune:
+            mask = self.block_topK_binarizer(torch.abs(self.weight))
+            self.weight.data = self.weight.data * mask
+            self.should_prune = False
 
         x = x.permute(0,2,3,1)
-        x = torch.matmul(x, weight_thresholded.T)
+        x = torch.matmul(x, self.weight.T)
         x = x.permute(0,3,1,2)
 
         if self.add_bias: 

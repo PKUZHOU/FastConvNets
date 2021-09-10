@@ -41,7 +41,7 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
 
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=40, type=int, metavar='N',
+parser.add_argument('--epochs', default=10, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -50,9 +50,8 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
                          'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
-parser.add_argument('--mask_scores_learning_rate', default=0.01, type=float, help='initial mask_scores learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
@@ -103,9 +102,9 @@ parser.add_argument(
     help="Run `final_warmup` * `warmup_steps` steps of threshold cool-down during which threshold stays"
     "at its final_threshold value (sparsity schedule).",
 )
-parser.add_argument('--sparsity', default=0.5, type=float, help= " the ratio of non-zero elements" )
 
 parser.add_argument('--block_size', default=1, type=int,  help="if block size > 1, then use block sparse")
+parser.add_argument('--prune_steps', default=1000, type=int,  help="for gradual magnitude pruning")
 
 
 best_acc1 = 0
@@ -168,13 +167,13 @@ def main_worker(gpu, ngpus_per_node, args):
         # only mobilenet_v2  uses sparse 1x1 conv 
         #TODO : support more models ? 
         if args.arch == 'mobilenet_v2':
-            model = sparse_mobilenet_v2(pretrained=True, sparsity = args.sparsity, block_size=args.block_size)
+            model = sparse_mobilenet_v2(pretrained=True, sparsity = args.initial_threshold, block_size=args.block_size)
         else:
             model = models.__dict__[args.arch](pretrained=True)
     else:
         print("=> creating model '{}'".format(args.arch))
         if args.arch == 'mobilenet_v2':
-            model = sparse_mobilenet_v2( sparsity = args.sparsity, block_size = args.block_size)
+            model = sparse_mobilenet_v2( sparsity = args.initial_threshold, block_size = args.block_size)
         else:
             model = models.__dict__[args.arch]()
 
@@ -213,10 +212,6 @@ def main_worker(gpu, ngpus_per_node, args):
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
     optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if "mask_score" in n and p.requires_grad],
-            "lr": args.mask_scores_learning_rate,
-        },
         {
             "params": [
                 p
@@ -300,6 +295,7 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
+
         schedule_threshold(model, 
             epoch= epoch, total_epoch = args.epochs, 
             final_threshold = args.final_threshold,
@@ -354,6 +350,12 @@ def schedule_threshold(
         if hasattr(module, 'sparsity'):
             module.sparsity = threshold
 
+def prune_weights(model):
+    print("Prune weights")
+    for module in model.modules():
+        if hasattr(module, 'should_prune'):
+            module.should_prune = True
+
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -371,6 +373,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
+        
+        if i % args.prune_steps == 0:
+            prune_weights(model)
+
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -497,12 +503,12 @@ class ProgressMeter(object):
 def adjust_learning_rate(optimizer, epoch, args):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
     lr = args.lr * (0.1 ** (epoch // 30))
-    m_lr = args.mask_scores_learning_rate * (0.1 ** (epoch // 30))
-    optimizer.param_groups[0]['lr'] = m_lr
-    optimizer.param_groups[1]['lr'] = lr
+    # m_lr = args.mask_scores_learning_rate * (0.1 ** (epoch // 30))
+    # optimizer.param_groups[0]['lr'] = m_lr
+    # optimizer.param_groups[1]['lr'] = lr
 
-    # for param_group in optimizer.param_groups:
-    #     param_group['lr'] = lr
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
 
 
 def accuracy(output, target, topk=(1,)):
